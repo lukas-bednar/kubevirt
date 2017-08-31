@@ -40,7 +40,7 @@ curl -LO https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSI
 export VAGRANT_DOTFILE_PATH="${VAGRANT_DOTFILE_PATH:-$WORKSPACE/.vagrant}"
 
 # Make sure that the VM is properly shut down on exit
-trap '{ vagrant halt; }' EXIT
+#trap '{ vagrant halt; }' EXIT
 
 set +e
 vagrant up --provider=libvirt
@@ -139,4 +139,4 @@ kubectl version
 # Disable proxy configuration since it causes test issues
 export -n http_proxy
 # Run functional tests
-FUNC_TEST_ARGS="--ginkgo.noColor" make functest
+# FUNC_TEST_ARGS="--ginkgo.noColor" make functest
