@@ -1,0 +1,6 @@
+{
+  "plugins": ["swagger"],
+    "structure": {
+        "readme": "api-doc.md"
+    }
+}
