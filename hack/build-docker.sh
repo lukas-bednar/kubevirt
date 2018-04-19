@@ -31,6 +31,7 @@ fi
 
 if [ $# -eq 0 ]; then
     args=$docker_images
+    build_tests="true"
 else
     args=$@
 fi
@@ -49,3 +50,12 @@ for arg in $args; do
         )
     fi
 done
+if [[ "${build_tests}" == "true" ]]; then
+    if [[ "${target}" == "build" ]]; then
+        build_func_tests_container
+    fi
+    if [[ "${target}" == "push" ]]; then
+        cd ${TESTS_OUT_DIR}
+        docker $target ${docker_prefix}/tests:${docker_tag}
+    fi
+fi
