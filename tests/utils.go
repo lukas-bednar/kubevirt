@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ghodss/yaml"
 	"github.com/google/goexpect"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -47,9 +49,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
 	k8sversion "k8s.io/apimachinery/pkg/version"
@@ -74,6 +78,8 @@ var KubeVirtOcPath = ""
 var KubeVirtVirtctlPath = ""
 var KubeVirtInstallNamespace string
 
+var DeployTestingInfrastructureFlag = false
+var PathToTestingInfrastrucureManifests = ""
 
 func init() {
 	flag.StringVar(&KubeVirtVersionTag, "docker-tag", "latest", "Set the image tag or digest to use")
@@ -82,6 +88,8 @@ func init() {
 	flag.StringVar(&KubeVirtOcPath, "oc-path", "", "Set path to oc binary")
 	flag.StringVar(&KubeVirtVirtctlPath, "virtctl-path", "", "Set path to virtctl binary")
 	flag.StringVar(&KubeVirtInstallNamespace, "installed-namespace", "kubevirt", "Set the namespace KubeVirt is installed in")
+	flag.BoolVar(&DeployTestingInfrastructureFlag, "deploy-testing-infra", false, "Deploy testing infrastructure if set")
+	flag.StringVar(&PathToTestingInfrastrucureManifests, "path-to-testing-infra-manifests", "manifests/testing", "Set path to testing infrastructure manifests")
 }
 
 type EventType string
@@ -350,7 +358,11 @@ func AfterTestSuitCleanup() {
 	DeletePVC(osAlpineHostPath)
 	DeletePV(osAlpineHostPath)
 
+	if DeployTestingInfrastructureFlag {
+		WipeTestingInfrastructure()
+	}
 	removeNamespaces()
+
 }
 
 func BeforeTestCleanup() {
@@ -363,6 +375,10 @@ func BeforeTestSuitSetup() {
 
 	createNamespaces()
 	createServiceAccounts()
+	if DeployTestingInfrastructureFlag {
+		WipeTestingInfrastructure()
+		DeployTestingInfrastructure()
+	}
 
 	CreateHostPathPv(osAlpineHostPath, HostPathAlpine)
 	CreatePVC(osAlpineHostPath, defaultDiskSize)
@@ -439,6 +455,169 @@ func CreateSecret(name string, data map[string]string) {
 	})
 	if !errors.IsAlreadyExists(err) {
 		PanicOnError(err)
+	}
+}
+
+func GetListOfManifests(pathToManifestsDir string) []string {
+	var manifests []string
+	files, err := ioutil.ReadDir(pathToManifestsDir)
+	if err != nil {
+		panic(err)
+	}
+	matchFileName := func(pattern, filename string) bool {
+		match, err := filepath.Match(pattern, filename)
+		if err != nil {
+			panic(err)
+		}
+		return match
+	}
+	isOpenshift := IsOpenShift()
+	for _, file := range files {
+		if matchFileName("*-for-ocp.yaml", file.Name()) {
+			if isOpenshift {
+				manifests = append(manifests, filepath.Join(pathToManifestsDir, file.Name()))
+			}
+		} else if matchFileName("*-for-k8s.yaml", file.Name()) {
+			if !isOpenshift {
+				manifests = append(manifests, filepath.Join(pathToManifestsDir, file.Name()))
+			}
+		} else if matchFileName("*.yaml", file.Name()) {
+			manifests = append(manifests, filepath.Join(pathToManifestsDir, file.Name()))
+		}
+	}
+	return manifests
+}
+
+func ReadManifestYamlFile(pathToManifest string) []unstructured.Unstructured {
+	// Read manifest
+	content, err := ioutil.ReadFile(pathToManifest)
+	PanicOnError(err)
+	// Split manifest by `---` to get single objects
+	fileAsString := string(content[:])
+	sepYamlfiles := strings.Split(fileAsString, "---")
+	// Parse each object
+	objects := make([]unstructured.Unstructured, 0, len(sepYamlfiles))
+	for _, f := range sepYamlfiles {
+		if f == "\n" || f == "" {
+			// Ignore empty cases
+			continue
+		}
+
+		jsonrepr, err := yaml.YAMLToJSON([]byte(f))
+		PanicOnError(err)
+		var obj map[string]interface{}
+		err = json.Unmarshal([]byte(jsonrepr), &obj)
+		if err != nil {
+			fmt.Printf(fmt.Sprintf("ERROR: Can not unmarshall YAML %s\n", err))
+			continue
+		}
+		unstruct := unstructured.Unstructured{}
+		unstruct.SetUnstructuredContent(obj)
+		if unstruct.GetKind() == "" {
+			// Skip empty structss
+			continue
+		}
+
+		objects = append(objects, unstruct)
+	}
+
+	return objects
+}
+
+func isNamespaceScoped(kind schema.GroupVersionKind) bool {
+	switch kind.Kind {
+	case "ClusterRole", "ClusterRoleBinding":
+		return false
+	}
+	return true
+}
+
+func IsOpenShift() bool {
+	virtClient, err := kubecli.GetKubevirtClient()
+	PanicOnError(err)
+
+	result := virtClient.RestClient().Get().AbsPath("/version/openshift").Do()
+
+	if result.Error() == nil {
+		return true
+	}
+	var code int
+	result.StatusCode(&code)
+	if code != http.StatusNotFound {
+		fmt.Printf(fmt.Sprintf("ERROR: Can not determine cluster type %#v\n", result))
+		panic(err)
+	}
+	return false
+}
+
+func composeResourceURI(object unstructured.Unstructured) string {
+	uri := "/api"
+	if object.GetAPIVersion() != "v1" {
+		uri += "s"
+	}
+	uri += "/" + object.GetAPIVersion()
+	if object.GetNamespace() != "" && isNamespaceScoped(object.GroupVersionKind()) {
+		uri += "/namespaces/" + object.GetNamespace()
+	}
+	uri += "/" + strings.ToLower(object.GetKind())
+	if object.GetKind()[len(object.GetKind())-1:] != "s" {
+		uri += "s"
+	}
+	return uri
+}
+
+func ApplyRawManifest(object unstructured.Unstructured) error {
+	virtCli, err := kubecli.GetKubevirtClient()
+	PanicOnError(err)
+
+	uri := composeResourceURI(object)
+	jsonbody, err := object.MarshalJSON()
+	PanicOnError(err)
+	b, err := virtCli.CoreV1().RESTClient().Post().RequestURI(uri).Body(jsonbody).DoRaw()
+	if err != nil {
+		fmt.Printf(fmt.Sprintf("ERROR: Can not apply %s\n", object))
+		panic(err)
+	}
+	status := unstructured.Unstructured{}
+	return json.Unmarshal(b, &status)
+}
+
+func DeleteRawManifest(object unstructured.Unstructured) error {
+	virtCli, err := kubecli.GetKubevirtClient()
+	PanicOnError(err)
+
+	uri := composeResourceURI(object)
+	uri = uri + "/" + object.GetName()
+	PanicOnError(err)
+	result := virtCli.CoreV1().RESTClient().Delete().RequestURI(uri).Do()
+	var code int
+	result.StatusCode(&code)
+	if result.Error() != nil && code != http.StatusNotFound {
+		fmt.Printf(fmt.Sprintf("ERROR: Can not delete %s\n", object))
+		panic(err)
+	}
+	return nil
+}
+
+func DeployTestingInfrastructure() {
+	manifests := GetListOfManifests(PathToTestingInfrastrucureManifests)
+	for _, manifest := range manifests {
+		objects := ReadManifestYamlFile(manifest)
+		for _, obj := range objects {
+			err := ApplyRawManifest(obj)
+			PanicOnError(err)
+		}
+	}
+}
+
+func WipeTestingInfrastructure() {
+	manifests := GetListOfManifests(PathToTestingInfrastrucureManifests)
+	for _, manifest := range manifests {
+		objects := ReadManifestYamlFile(manifest)
+		for _, obj := range objects {
+			err := DeleteRawManifest(obj)
+			PanicOnError(err)
+		}
 	}
 }
 
@@ -2357,12 +2536,7 @@ func SkipIfVersionBelow(message string, expectedVersion string) {
 }
 
 func SkipIfOpenShift(message string) {
-	virtClient, err := kubecli.GetKubevirtClient()
-	PanicOnError(err)
-
-	result := virtClient.RestClient().Get().AbsPath("/version/openshift").Do()
-
-	if result.Error() == nil {
+	if IsOpenShift() {
 		Skip("Openshift detected: " + message)
 	}
 }
