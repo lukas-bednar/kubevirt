@@ -893,7 +893,7 @@ func EnsureKVMPresent() {
 				ready = ready && (kvmAllocatable.Value() > 0) && (vhostNetAllocatable.Value() > 0)
 			}
 			return ready
-		}, 120*time.Second, 1*time.Second).Should(BeTrue(),
+		}, 300*time.Second, 1*time.Second).Should(BeTrue(),
 			"Both KVM devices and vhost-net devices are required for testing, but are not present on cluster nodes")
 	}
 }
