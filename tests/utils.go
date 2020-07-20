@@ -1218,7 +1218,7 @@ func deployOrWipeTestingInfrastrucure(actionOnObject func(unstructured.Unstructu
 		return d.Status.NumberAvailable
 	}, 1*time.Minute, 2*time.Second).Should(Equal(daemonInstances), "virt-handler is not ready")
 
-	WaitForAllPodsReady(3*time.Minute, metav1.ListOptions{})
+	//WaitForAllPodsReady(3*time.Minute, metav1.ListOptions{})
 }
 
 func DeployTestingInfrastructure() {
